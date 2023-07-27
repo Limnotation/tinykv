@@ -11,10 +11,11 @@ import (
 // All engines are badger key/value databases.
 // the Path fields are the filesystem path to where the data is stored.
 type Engines struct {
-	// Data, including data which is committed (i.e., committed across other nodes) and un-committed (i.e., only present
-	// locally).
+	// Data, including data which is committed (i.e., committed across other nodes)
+	// and un-committed (i.e., only present locally).
 	Kv     *badger.DB
 	KvPath string
+
 	// Metadata used by Raft.
 	Raft     *badger.DB
 	RaftPath string
