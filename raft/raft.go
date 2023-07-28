@@ -16,8 +16,10 @@ package raft
 
 import (
 	"errors"
+	"math/rand"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"go.uber.org/zap"
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -133,11 +135,20 @@ type Raft struct {
 
 	// heartbeat interval, should send
 	heartbeatTimeout int
+
 	// baseline of election interval
 	electionTimeout int
+
+	// randomizedElectionTimeout is a random number between
+	// [electiontimeout, 2 * electiontimeout - 1]. It gets reset
+	// when raft changes its state to follower or candidate. This
+	// is to avoid followers to timeout at the same time.
+	randomizedElectionTimeout int
+
 	// number of ticks since it reached last heartbeatTimeout.
 	// only leader keeps heartbeatElapsed.
 	heartbeatElapsed int
+
 	// Ticks since it reached last electionTimeout when it is leader or candidate.
 	// Number of ticks since it reached last electionTimeout or received a
 	// valid message from current leader when it is a follower.
@@ -157,6 +168,8 @@ type Raft struct {
 	// value.
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
+
+	RaftLgr *zap.Logger
 }
 
 // newRaft return a raft peer with the given config
@@ -165,7 +178,11 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	return nil
+	lgr, _ := zap.NewProduction()
+
+	return &Raft{
+		RaftLgr: lgr,
+	}
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -182,7 +199,51 @@ func (r *Raft) sendHeartbeat(to uint64) {
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
-	// Your Code Here (2A).
+	switch r.State {
+	case StateFollower:
+		r.tickElection()
+	case StateCandidate:
+		r.tickElection()
+	case StateLeader:
+		r.tickHeartbeat()
+	}
+}
+
+// tickElection is run by followers and candidates after r.electionTimeout.
+// mimic logic from etcd raft:
+//  1. node must be `promotable`
+//  2. election elapsed must be greater than a randomized election timeout
+func (r *Raft) tickElection() {
+	r.electionElapsed++
+	if r.promotable() && r.electionElapsed >= r.randomizedElectionTimeout {
+		r.electionElapsed = 0
+		r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
+	}
+}
+
+func (r *Raft) promotable() bool {
+	return r.Prs[r.id] != nil
+}
+
+// tickHeartbeat is run by leaders to send a MessageType_MsgHeartbeat to
+// their followers after r.heartbeatTimeout.
+func (r *Raft) tickHeartbeat() {
+	r.electionElapsed++
+	r.heartbeatElapsed++
+
+	// Only leader can do heartbeats.
+	if r.State != StateLeader {
+		return
+	}
+
+	if r.heartbeatElapsed >= r.heartbeatTimeout {
+		r.heartbeatElapsed = 0
+		r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat})
+	}
+}
+
+func (r *Raft) resetRandomizedElectionTimeout() {
+	r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 }
 
 // becomeFollower transform this peer's state to Follower
@@ -192,7 +253,14 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
-	// Your Code Here (2A).
+	if r.State == StateLeader {
+		r.RaftLgr.Fatal("invalid transition [leader -> candidate]")
+	}
+
+	r.Vote = r.id
+	r.State = StateCandidate
+	r.reset(r.Term + 1)
+	r.RaftLgr.Sugar().Infof("[%d] became candidate at term [%d]", r.id, r.Term)
 }
 
 // becomeLeader transform this peer's state to leader
@@ -201,16 +269,68 @@ func (r *Raft) becomeLeader() {
 	// NOTE: Leader should propose a noop entry on its term
 }
 
+// reset resets some state of current raft instance when instance
+// state changes.
+func (r *Raft) reset(term uint64) {
+	if r.Term != term {
+		r.Term = term
+		r.Vote = None
+	}
+	r.Lead = None
+
+	r.electionElapsed = 0
+	r.heartbeatElapsed = 0
+	r.resetRandomizedElectionTimeout()
+}
+
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	// TODO: might need extra switch block to deal with msg terms.
+
 	switch r.State {
 	case StateFollower:
+		switch m.MsgType {
+		case pb.MessageType_MsgHup:
+			r.campaign()
+		}
 	case StateCandidate:
+		switch m.MsgType {
+		case pb.MessageType_MsgHup:
+			r.campaign()
+		}
 	case StateLeader:
+		switch m.MsgType {
+		case pb.MessageType_MsgHup:
+			r.RaftLgr.Error("Ignoring MessageType_MsgHup because already leader", zap.Any("id", r.id))
+		}
 	}
 	return nil
+}
+
+func (r *Raft) campaign() {
+	// Sanity check, better safe than sorry.
+	if !r.promotable() {
+		r.RaftLgr.Warn("campaign called on unpromotable node", zap.Any("id", r.id))
+	}
+
+	// No pre-vote process, head straight to vote. In raft, only candidates
+	// can participate in election, so a state transition is needed.
+	r.becomeCandidate()
+	voteMsg := pb.MessageType_MsgRequestVote
+	term := r.Term
+
+	// Iterate voter list and send vote request.
+	for voter := range r.votes {
+		r.RaftLgr.Sugar().Infof("[%d] sending vote request to [%d] at term [%d]", r.id, voter, term)
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: voteMsg,
+			To:      voter,
+			From:    r.id,
+			Term:    term,
+		})
+	}
 }
 
 // handleAppendEntries handle AppendEntries RPC request

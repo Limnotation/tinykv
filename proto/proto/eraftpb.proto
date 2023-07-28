@@ -37,7 +37,8 @@ message Snapshot {
 }
 
 // Some MessageType defined here are local messages which not come from the network, but should
-// also use the Step method to handle
+// also use the Step method to handle.
+// `local` has one implication: Only the `msg_type` matters.
 enum MessageType {
     // 'MessageType_MsgHup' is a local message used for election. If an election timeout happened,
     // the node should pass 'MessageType_MsgHup' to its Step method and start a new election.
