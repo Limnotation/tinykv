@@ -177,24 +177,78 @@ func newRaft(c *Config) *Raft {
 	if err := c.validate(); err != nil {
 		panic(err.Error())
 	}
-	// Your Code Here (2A).
-	lgr, _ := zap.NewProduction()
 
-	return &Raft{
-		RaftLgr: lgr,
+	// Parse config.
+	lgr, _ := zap.NewProduction()
+	prs := make(map[uint64]*Progress, 0)
+	votes := make(map[uint64]bool, 0)
+	for _, peer := range c.peers {
+		prs[peer] = &Progress{
+			Match: 0,
+			Next:  0,
+		}
+		votes[peer] = false
 	}
+
+	r := &Raft{
+		id:               c.ID,
+		RaftLog:          newLog(c.Storage),
+		Prs:              prs,
+		votes:            votes,
+		electionTimeout:  c.ElectionTick,
+		heartbeatTimeout: c.HeartbeatTick,
+		RaftLgr:          lgr,
+	}
+
+	// All raft instances start as followers.
+	r.becomeFollower(r.Term, None)
+
+	return r
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	return false
+	pr := r.Prs[to]
+	if pr == nil {
+		return false
+	}
+
+	m := pb.Message{}
+	m.From = r.id
+	m.To = to
+
+	// See if there is any entries to send. For now, we do not
+	// care about snapshots, so just return in case of error.
+	term, errt := r.RaftLog.Term(pr.Next - 1)
+	if errt != nil {
+		return false
+	}
+
+	// TODO: Try get entries from log to send.
+	ents := make([]*pb.Entry, 0)
+
+	m.MsgType = pb.MessageType_MsgAppend
+	m.Index = pr.Next - 1
+	m.LogTerm = term
+	m.Entries = ents
+	m.Commit = r.RaftLog.committed
+
+	r.msgs = append(r.msgs, m)
+	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
-	// Your Code Here (2A).
+	m := pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeat,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+	}
+
+	r.msgs = append(r.msgs, m)
 }
 
 // tick advances the internal logical clock by a single tick.
@@ -210,8 +264,8 @@ func (r *Raft) tick() {
 }
 
 // tickElection is run by followers and candidates after r.electionTimeout.
-// mimic logic from etcd raft:
-//  1. node must be `promotable`
+// mimic logic in etcd raft:
+//  1. node must be `promotable` to be able to participate in election.
 //  2. election elapsed must be greater than a randomized election timeout
 func (r *Raft) tickElection() {
 	r.electionElapsed++
@@ -248,7 +302,11 @@ func (r *Raft) resetRandomizedElectionTimeout() {
 
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
-	// Your Code Here (2A).
+	r.Lead = lead
+	r.State = StateFollower
+	r.reset(term)
+
+	r.RaftLgr.Sugar().Infof("[%d] became follower at term [%d]", r.id, r.Term)
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -257,16 +315,27 @@ func (r *Raft) becomeCandidate() {
 		r.RaftLgr.Fatal("invalid transition [leader -> candidate]")
 	}
 
+	r.reset(r.Term + 1)
+
 	r.Vote = r.id
 	r.State = StateCandidate
-	r.reset(r.Term + 1)
 	r.RaftLgr.Sugar().Infof("[%d] became candidate at term [%d]", r.id, r.Term)
 }
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
-	// Your Code Here (2A).
-	// NOTE: Leader should propose a noop entry on its term
+	if r.State == StateFollower {
+		r.RaftLgr.Fatal("invalid transition [follower -> leader]")
+	}
+
+	r.Lead = r.id
+	r.State = StateLeader
+	r.reset(r.Term)
+
+	// Newly elected leader need to append a noop entry on its term.
+	// noopEnt := pb.Entry{Data: nil}
+
+	r.RaftLgr.Sugar().Infof("[%d] became leader at term [%d]", r.id, r.Term)
 }
 
 // reset resets some state of current raft instance when instance
@@ -286,24 +355,122 @@ func (r *Raft) reset(term uint64) {
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
-	// Your Code Here (2A).
-	// TODO: might need extra switch block to deal with msg terms.
+	switch {
+	case m.Term == 0:
+		// Do nothing with local messages.
+	case m.Term > r.Term:
+		// A general principle is that, when receiving a message with a
+		// higher term, the current raft instance should convert to or
+		// remain as a follower.
+		r.RaftLgr.Sugar().Infof("%x [term: %d] received a [%s] message with higher term from %x [term: %d]",
+			r.id, r.Term, m.MsgType, m.From, m.Term)
 
+		// When receiving message with higher term from a leader, follow
+		// that leader, follow no one otherwise.
+		if m.MsgType == pb.MessageType_MsgHeartbeat || m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgSnapshot {
+			r.becomeFollower(m.Term, m.From)
+		} else {
+			r.becomeFollower(m.Term, None)
+		}
+	case m.Term < r.Term:
+		// For now, when receiving messages with lower terms, we simply
+		// ignore them.
+		r.RaftLgr.Sugar().Infof("%x [term: %d] ignored a %s message with lower term from %x [term: %d]",
+			r.id, r.Term, m.MsgType, m.From, m.Term)
+	}
+
+	// All messages that are handled in the following block are guaranteed
+	// to have m.Term >= r.Term.
+
+	// TODO: add logic handle messages by message type.
+
+	canVote := r.Vote == m.From || (r.Vote == None && r.Lead == None)
 	switch r.State {
 	case StateFollower:
 		switch m.MsgType {
 		case pb.MessageType_MsgHup:
 			r.campaign()
+		case pb.MessageType_MsgRequestVote:
+			if canVote {
+				r.RaftLgr.Sugar().Infof("%x [vote: %x] cast vote for %x at term %d",
+					r.id, r.Vote, m.From, r.Term)
+
+				r.electionElapsed = 0
+				r.Vote = m.From
+				r.msgs = append(r.msgs, pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					To:      m.From,
+					From:    r.id,
+					Term:    m.Term,
+					Reject:  false,
+				})
+			} else {
+				r.RaftLgr.Sugar().Infof("%x [vote: %x] rejected vote for %x at term %d",
+					r.id, r.Vote, m.From, r.Term)
+
+				r.msgs = append(r.msgs, pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					To:      m.From,
+					From:    r.id,
+					Term:    m.Term,
+					Reject:  true,
+				})
+			}
+		case pb.MessageType_MsgAppend:
+			r.electionElapsed = 0
+			r.Lead = m.From
+			r.handleAppendEntries(m)
+		default:
+			r.RaftLgr.Info("Message type that follower will not handle", zap.Any("type", m.MsgType))
 		}
 	case StateCandidate:
 		switch m.MsgType {
 		case pb.MessageType_MsgHup:
 			r.campaign()
+		case pb.MessageType_MsgRequestVote:
+			if canVote {
+				r.RaftLgr.Sugar().Infof("%x [vote: %x] cast vote for %x at term %d",
+					r.id, r.Vote, m.From, r.Term)
+				r.electionElapsed = 0
+				r.Vote = m.From
+				r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgRequestVoteResponse, To: m.From, Term: m.Term, Reject: false})
+			} else {
+				r.RaftLgr.Sugar().Infof("%x [vote: %x] rejected vote for %x at term %d",
+					r.id, r.Vote, m.From, r.Term)
+			}
+		case pb.MessageType_MsgRequestVoteResponse:
+			if m.Reject {
+				r.votes[m.From] = false
+			} else {
+				r.votes[m.From] = true
+			}
+
+			tally := 0
+			for _, v := range r.votes {
+				if v {
+					tally++
+				}
+			}
+			if tally > len(r.Prs)/2 {
+				// On winning the election, leader needs to send out `append` messages
+				// to commit previous entries and notifying followers of its leadership.
+				r.becomeLeader()
+				r.bcastAppend()
+			}
+		case pb.MessageType_MsgAppend:
+			r.becomeFollower(m.Term, m.From)
+			r.handleAppendEntries(m)
+		default:
+			r.RaftLgr.Info("Message type that candidate will not handle", zap.Any("type", m.MsgType))
 		}
 	case StateLeader:
 		switch m.MsgType {
 		case pb.MessageType_MsgHup:
-			r.RaftLgr.Error("Ignoring MessageType_MsgHup because already leader", zap.Any("id", r.id))
+			r.RaftLgr.Error("Ignoring MessageType_MsgHup because current role is already leader", zap.Any("id", r.id))
+		case pb.MessageType_MsgBeat:
+			r.bcastHeartbeat()
+		default:
+			r.RaftLgr.Info("Message type that leader will not handle", zap.Any("type", m.MsgType))
 		}
 	}
 	return nil
@@ -321,8 +488,21 @@ func (r *Raft) campaign() {
 	voteMsg := pb.MessageType_MsgRequestVote
 	term := r.Term
 
-	// Iterate voter list and send vote request.
+	// When start election, always vote for self.
+	r.votes[r.id] = true
+
+	// Short cut: wins the election if there's only one node in the cluster.
+	if len(r.votes) == 1 && r.votes[r.id] {
+		r.becomeLeader()
+	}
+
+	// Iterate voter list and send vote request, but don't send vote message to self
+	// since a candidate will always vote for itself.
 	for voter := range r.votes {
+		if voter == r.id {
+			continue
+		}
+
 		r.RaftLgr.Sugar().Infof("[%d] sending vote request to [%d] at term [%d]", r.id, voter, term)
 		r.msgs = append(r.msgs, pb.Message{
 			MsgType: voteMsg,
@@ -330,6 +510,24 @@ func (r *Raft) campaign() {
 			From:    r.id,
 			Term:    term,
 		})
+	}
+}
+
+func (r *Raft) bcastHeartbeat() {
+	for peer := range r.Prs {
+		if peer == r.id {
+			continue
+		}
+		r.sendHeartbeat(peer)
+	}
+}
+
+func (r *Raft) bcastAppend() {
+	for peer := range r.Prs {
+		if peer == r.id {
+			continue
+		}
+		r.sendAppend(peer)
 	}
 }
 
