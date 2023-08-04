@@ -80,6 +80,7 @@ type MemoryStorage struct {
 
 	hardState pb.HardState
 	snapshot  pb.Snapshot
+
 	// ents[i] has raft log position i+snapshot.Metadata.Index
 	ents []pb.Entry
 }
@@ -253,6 +254,7 @@ func (ms *MemoryStorage) Append(entries []pb.Entry) error {
 	if last < first {
 		return nil
 	}
+
 	// truncate compacted entries
 	if first > entries[0].Index {
 		entries = entries[first-entries[0].Index:]

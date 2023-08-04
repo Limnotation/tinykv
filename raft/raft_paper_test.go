@@ -366,17 +366,27 @@ func TestLeaderStartReplication2AB(t *testing.T) {
 	r.becomeCandidate()
 	r.becomeLeader()
 	commitNoopEntry(r, s)
+
+	// li should be `1` in this case. At this point, there would be 2 entries
+	// in the log: the dummy entry created when MemoryStorage is inited, and
+	// the noop entry appended when leader is elected.
 	li := r.RaftLog.LastIndex()
 
 	ents := []*pb.Entry{{Data: []byte("some data")}}
 	r.Step(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: ents})
 
+	// g should be `2` now: the dummy, noop entry plus the newly proposed entry are
+	// stored in the raft log now.
 	if g := r.RaftLog.LastIndex(); g != li+1 {
 		t.Errorf("lastIndex = %d, want %d", g, li+1)
 	}
+
+	// g should be `1` now: only the noop entry is committed, the newly proposed
+	// entry is not replicated yet.
 	if g := r.RaftLog.committed; g != li {
 		t.Errorf("committed = %d, want %d", g, li)
 	}
+
 	msgs := r.readMessages()
 	sort.Sort(messageSlice(msgs))
 	ent := pb.Entry{Index: li + 1, Term: 1, Data: []byte("some data")}

@@ -127,3 +127,19 @@ func IsResponseMsg(msgt pb.MessageType) bool {
 func isHardStateEqual(a, b pb.HardState) bool {
 	return a.Term == b.Term && a.Vote == b.Vote && a.Commit == b.Commit
 }
+
+func messagePtrToStrucSlice(msgs []*pb.Entry) []pb.Entry {
+	var ms []pb.Entry
+	for _, m := range msgs {
+		ms = append(ms, *m)
+	}
+	return ms
+}
+
+func messageStrucSliceToPtrSlice(msgs []pb.Entry) []*pb.Entry {
+	var ms []*pb.Entry
+	for _, m := range msgs {
+		ms = append(ms, &m)
+	}
+	return ms
+}

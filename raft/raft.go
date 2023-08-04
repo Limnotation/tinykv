@@ -170,6 +170,8 @@ type Raft struct {
 	PendingConfIndex uint64
 
 	RaftLgr *zap.Logger
+
+	maxMsgSize uint64
 }
 
 // newRaft return a raft peer with the given config
@@ -178,6 +180,10 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 
+	// Some states need to be restored from raft log, so
+	// raft log need to be created first.
+	raftLog := newLog(c.Storage)
+
 	// Parse config.
 	lgr, _ := zap.NewProduction()
 	prs := make(map[uint64]*Progress, 0)
@@ -185,19 +191,20 @@ func newRaft(c *Config) *Raft {
 	for _, peer := range c.peers {
 		prs[peer] = &Progress{
 			Match: 0,
-			Next:  0,
+			Next:  raftLog.LastIndex() + 1,
 		}
 		votes[peer] = false
 	}
 
 	r := &Raft{
 		id:               c.ID,
-		RaftLog:          newLog(c.Storage),
+		RaftLog:          raftLog,
 		Prs:              prs,
 		votes:            votes,
 		electionTimeout:  c.ElectionTick,
 		heartbeatTimeout: c.HeartbeatTick,
 		RaftLgr:          lgr,
+		maxMsgSize:       1024 * 1024,
 	}
 
 	// All raft instances start as followers.
@@ -209,7 +216,6 @@ func newRaft(c *Config) *Raft {
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
-	// Your Code Here (2A).
 	pr := r.Prs[to]
 	if pr == nil {
 		return false
@@ -226,14 +232,19 @@ func (r *Raft) sendAppend(to uint64) bool {
 		return false
 	}
 
-	// TODO: Try get entries from log to send.
-	ents := make([]*pb.Entry, 0)
+	// Try get entries from log to send.
+	entss, err := r.RaftLog.entriesRange(pr.Next, r.maxMsgSize)
+	if len(entss) == 0 || err != nil {
+		return false
+	}
+	ents := messageStrucSliceToPtrSlice(entss)
 
 	m.MsgType = pb.MessageType_MsgAppend
 	m.Index = pr.Next - 1
 	m.LogTerm = term
 	m.Entries = ents
 	m.Commit = r.RaftLog.committed
+	m.Term = r.Term
 
 	r.msgs = append(r.msgs, m)
 	return true
@@ -322,18 +333,89 @@ func (r *Raft) becomeCandidate() {
 	r.RaftLgr.Sugar().Infof("[%d] became candidate at term [%d]", r.id, r.Term)
 }
 
+// appendEntry appends incoming entries to local raft log.
+func (r *Raft) appendEntry(es ...*pb.Entry) bool {
+	// Incoming entries' indices are relative to the slice, need to
+	// transform them to absolute indices in the raft log.
+	li := r.RaftLog.LastIndex()
+	for i := range es {
+		es[i].Term = r.Term
+		es[i].Index = li + 1 + uint64(i)
+	}
+
+	// New entries might append/truncate existing entries in the log,
+	// so might need to update the "last" index after the append.
+	ess := messagePtrToStrucSlice(es)
+	li = r.RaftLog.append(ess...)
+	r.Prs[r.id].Match = li
+	r.Prs[r.id].Next = li + 1
+
+	// Regardless of maybeCommit's return, our caller will call bcastAppend.
+	r.maybecommit()
+	return true
+}
+
+// maybeCommit attempts to advance the commit index. Returns true if
+// the commit index changed (in which case the caller should call
+// r.bcastAppend).
+func (r *Raft) maybecommit() {
+	// Find the largest index that a quorum of members have acknowledged,
+	// and then try to advance to commit index to this largest index.
+	//
+	// Here is the logic for computing the largest index:
+	//  1. Collect all peers' match index into a slice;
+	//  2. Sort the slice, by index in ascending order;
+	//  3. Suppose we have n nodes in the cluster, move from
+	// 	   the right end of the slice by (n/2) + 1 steps, the
+	//     value at that position is the largest commit index we need.
+	//
+	// For example, say we have five nodes in the quorum. From the perspective
+	// of the leader, the match indices of the five nodes are:
+	//  	[1, 3, 2, 2, 3]
+	// sort this slice we would have:
+	//		[1, 2, 2, 3, 3].
+	// Move from the right end by (5/2)+1 = 3 steps, we get 2, which is the
+	// largest commit index. This is very intuitive, we can see that over half
+	// of the members have match index >= 2.
+	// etcd/raft uses a much more complicated implementation, but for now we just
+	// stick to this simple one.
+	matchIndx := make([]uint64, 0)
+	for _, pr := range r.Prs {
+		matchIndx = append(matchIndx, pr.Match)
+	}
+	insertionSort(matchIndx)
+
+	n := len(r.Prs)
+	mci := matchIndx[n-(n/2+1)]
+
+	r.RaftLog.maybeCommit(mci, r.Term)
+}
+
+// Copy directly from etcd/raft implementation.
+func insertionSort(sl []uint64) {
+	a, b := 0, len(sl)
+	for i := a + 1; i < b; i++ {
+		for j := i; j > a && sl[j] < sl[j-1]; j-- {
+			sl[j], sl[j-1] = sl[j-1], sl[j]
+		}
+	}
+}
+
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
 	if r.State == StateFollower {
 		r.RaftLgr.Fatal("invalid transition [follower -> leader]")
 	}
 
+	r.reset(r.Term)
 	r.Lead = r.id
 	r.State = StateLeader
-	r.reset(r.Term)
 
-	// Newly elected leader need to append a noop entry on its term.
-	// noopEnt := pb.Entry{Data: nil}
+	// Newly elected leader need to append and commit a noop entry on its term.
+	noopEnt := pb.Entry{Data: nil}
+	if !r.appendEntry(&noopEnt) {
+		r.RaftLgr.Sugar().Panic("Empty entry was dropped.")
+	}
 
 	r.RaftLgr.Sugar().Infof("[%d] became leader at term [%d]", r.id, r.Term)
 }
@@ -420,6 +502,14 @@ func (r *Raft) Step(m pb.Message) error {
 			r.electionElapsed = 0
 			r.Lead = m.From
 			r.handleAppendEntries(m)
+		case pb.MessageType_MsgPropose:
+			if r.Lead == None {
+				r.RaftLgr.Sugar().Infof("%x no leader at term %d; dropping proposal", r.id, r.Term)
+				return ErrProposalDropped
+			} else {
+				m.To = r.Lead
+				r.msgs = append(r.msgs, m)
+			}
 		default:
 			r.RaftLgr.Info("Message type that follower will not handle", zap.Any("type", m.MsgType))
 		}
@@ -460,6 +550,10 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgAppend:
 			r.becomeFollower(m.Term, m.From)
 			r.handleAppendEntries(m)
+		case pb.MessageType_MsgPropose:
+			// Candidate cannot process propose requests since it has no leader.
+			r.RaftLgr.Sugar().Infof("%x [term: %d] no leader at term; dropping proposal", r.id, r.Term)
+			return ErrProposalDropped
 		default:
 			r.RaftLgr.Info("Message type that candidate will not handle", zap.Any("type", m.MsgType))
 		}
@@ -469,6 +563,52 @@ func (r *Raft) Step(m pb.Message) error {
 			r.RaftLgr.Error("Ignoring MessageType_MsgHup because current role is already leader", zap.Any("id", r.id))
 		case pb.MessageType_MsgBeat:
 			r.bcastHeartbeat()
+		case pb.MessageType_MsgPropose:
+			// Propose messages containing no entries are not allowed.
+			if len(m.Entries) == 0 {
+				r.RaftLgr.Sugar().Panic("MessageType_MsgPropose contains no entries", zap.Any("id", r.id))
+			}
+
+			// If we are not currently a member of the range (i.e. this node
+			// was removed from the configuration while serving as leader),
+			// drop any new proposals.
+			if r.Prs[r.id] == nil {
+				return ErrProposalDropped
+			}
+
+			// Leader cannot process requests while leadership transfer is in progress.
+			if r.leadTransferee != None {
+				r.RaftLgr.Sugar().Errorf("%x [term %d] transfer leadership to %x is in progress; dropping proposal", r.id, r.Term, r.leadTransferee)
+				return ErrProposalDropped
+			}
+
+			// Append the proposal to the local log before broadcast to followers.
+			if !r.appendEntry(m.Entries...) {
+				return ErrProposalDropped
+			}
+			r.bcastAppend()
+			return nil
+		case pb.MessageType_MsgAppendResponse:
+			if m.Reject {
+				r.RaftLgr.Sugar().Errorf("%x [term %d] received MessageType_MsgAppend rejection from %x for index %d",
+					r.id, r.Term, m.From, m.Index)
+			} else {
+				// No sanity checks yet, improve later.
+				r.Prs[m.From].Match = m.Index
+				r.Prs[m.From].Next = m.Index + 1
+
+				// Update commit index if possible.
+				reach := 0
+				for _, pr := range r.Prs {
+					if pr.Match >= r.RaftLog.committed {
+						reach++
+					}
+				}
+
+				if reach > len(r.Prs)/2 {
+					r.maybecommit()
+				}
+			}
 		default:
 			r.RaftLgr.Info("Message type that leader will not handle", zap.Any("type", m.MsgType))
 		}
@@ -522,6 +662,7 @@ func (r *Raft) bcastHeartbeat() {
 	}
 }
 
+// bcastAppend broadcasts leader's entries to all followers.
 func (r *Raft) bcastAppend() {
 	for peer := range r.Prs {
 		if peer == r.id {
@@ -531,9 +672,42 @@ func (r *Raft) bcastAppend() {
 	}
 }
 
-// handleAppendEntries handle AppendEntries RPC request
+// handleAppendEntries handle AppendEntries RPC request for
+// followers and candidates.
 func (r *Raft) handleAppendEntries(m pb.Message) {
-	// Your Code Here (2A).
+	// If the incoming message's index is smaller than current member's
+	// commit index, respond with current member's commit index.
+	if m.Index < r.RaftLog.committed {
+		r.msgs = append(r.msgs, pb.Message{
+			To:      m.From,
+			From:    r.id,
+			Term:    r.Term,
+			MsgType: pb.MessageType_MsgAppendResponse,
+			Index:   r.RaftLog.committed,
+		})
+		return
+	}
+
+	// Try to append entries to local log, respond with the lastest raft log
+	// index to the leader for it to update the progress.
+	if mlastIndex, ok := r.RaftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, messagePtrToStrucSlice(m.Entries)...); ok {
+		r.msgs = append(r.msgs, pb.Message{
+			To:      m.From,
+			MsgType: pb.MessageType_MsgAppendResponse,
+			Term:    r.Term,
+			Index:   mlastIndex,
+		})
+	} else {
+		r.RaftLgr.Sugar().Errorf("%x [term %d] rejected MessageType_MsgAppend from %x for index %d",
+			r.id, r.Term, m.From, m.Index)
+		r.msgs = append(r.msgs, pb.Message{
+			To:      m.From,
+			MsgType: pb.MessageType_MsgAppendResponse,
+			Term:    r.Term,
+			Index:   m.Index,
+			Reject:  true,
+		})
+	}
 }
 
 // handleHeartbeat handle Heartbeat RPC request
