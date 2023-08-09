@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"fmt"
 	"math/rand"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
@@ -578,7 +579,8 @@ func (r *Raft) Step(m pb.Message) error {
 
 			// Leader cannot process requests while leadership transfer is in progress.
 			if r.leadTransferee != None {
-				r.RaftLgr.Sugar().Errorf("%x [term %d] transfer leadership to %x is in progress; dropping proposal", r.id, r.Term, r.leadTransferee)
+				r.RaftLgr.Error(fmt.Sprintf("%x [term %d] transfer leadership to %x is in progress; dropping proposal",
+					r.id, r.Term, r.leadTransferee))
 				return ErrProposalDropped
 			}
 
@@ -590,8 +592,14 @@ func (r *Raft) Step(m pb.Message) error {
 			return nil
 		case pb.MessageType_MsgAppendResponse:
 			if m.Reject {
-				r.RaftLgr.Sugar().Errorf("%x [term %d] received MessageType_MsgAppend rejection from %x for index %d",
-					r.id, r.Term, m.From, m.Index)
+				r.RaftLgr.Error(fmt.Sprintf("%x [term %d] received MessageType_MsgAppend rejection from %x for index %d",
+					r.id, r.Term, m.From, m.Index))
+
+				// On failure, the leader might has the wrong progress info about
+				// the follower who just rejected. In this case, extract the hint
+				// from the follower's return message and update progress accordingly
+				// and then resend the append message.
+
 			} else {
 				// No sanity checks yet, improve later.
 				r.Prs[m.From].Match = m.Index
@@ -689,7 +697,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	}
 
 	// Try to append entries to local log, respond with the lastest raft log
-	// index to the leader for it to update the progress.
+	// index to the leader for it to update the progress when succeed.
 	if mlastIndex, ok := r.RaftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, messagePtrToStrucSlice(m.Entries)...); ok {
 		r.msgs = append(r.msgs, pb.Message{
 			To:      m.From,
@@ -698,14 +706,15 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			Index:   mlastIndex,
 		})
 	} else {
-		r.RaftLgr.Sugar().Errorf("%x [term %d] rejected MessageType_MsgAppend from %x for index %d",
-			r.id, r.Term, m.From, m.Index)
+		r.RaftLgr.Error(fmt.Sprintf("%x [term %d] rejected MessageType_MsgAppend from %x for index %d",
+			r.id, r.Term, m.From, m.Index))
 		r.msgs = append(r.msgs, pb.Message{
-			To:      m.From,
-			MsgType: pb.MessageType_MsgAppendResponse,
-			Term:    r.Term,
-			Index:   m.Index,
-			Reject:  true,
+			To:         m.From,
+			MsgType:    pb.MessageType_MsgAppendResponse,
+			Term:       r.Term,
+			Index:      m.Index,
+			Reject:     true,
+			RejectHint: r.RaftLog.LastIndex(),
 		})
 	}
 }
