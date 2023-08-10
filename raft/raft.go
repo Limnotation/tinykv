@@ -591,15 +591,21 @@ func (r *Raft) Step(m pb.Message) error {
 			r.bcastAppend()
 			return nil
 		case pb.MessageType_MsgAppendResponse:
+			if pr := r.Prs[m.From]; pr == nil {
+				r.RaftLgr.Sugar().Warnf("[%x] no progress available for [%x]", r.id, m.From)
+				return nil
+			}
+
 			if m.Reject {
-				r.RaftLgr.Error(fmt.Sprintf("%x [term %d] received MessageType_MsgAppend rejection from %x for index %d",
+				r.RaftLgr.Warn(fmt.Sprintf("%x [term %d] received MessageType_MsgAppend rejection from %x for index %d",
 					r.id, r.Term, m.From, m.Index))
 
 				// On failure, the leader might has the wrong progress info about
 				// the follower who just rejected. In this case, extract the hint
 				// from the follower's return message and update progress accordingly
 				// and then resend the append message.
-
+				r.Prs[m.From].Next = min(m.Index, m.RejectHint+1)
+				r.sendAppend(m.From)
 			} else {
 				// No sanity checks yet, improve later.
 				r.Prs[m.From].Match = m.Index
@@ -613,8 +619,11 @@ func (r *Raft) Step(m pb.Message) error {
 					}
 				}
 
+				// If succeeded in updating the commit index, need
+				// to update the commit index to all followers.
 				if reach > len(r.Prs)/2 {
 					r.maybecommit()
+					r.bcastAppend()
 				}
 			}
 		default:
@@ -701,15 +710,17 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	if mlastIndex, ok := r.RaftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, messagePtrToStrucSlice(m.Entries)...); ok {
 		r.msgs = append(r.msgs, pb.Message{
 			To:      m.From,
+			From:    r.id,
 			MsgType: pb.MessageType_MsgAppendResponse,
 			Term:    r.Term,
 			Index:   mlastIndex,
 		})
 	} else {
-		r.RaftLgr.Error(fmt.Sprintf("%x [term %d] rejected MessageType_MsgAppend from %x for index %d",
+		r.RaftLgr.Warn(fmt.Sprintf("%x [term %d] rejected MessageType_MsgAppend from %x for index %d",
 			r.id, r.Term, m.From, m.Index))
 		r.msgs = append(r.msgs, pb.Message{
 			To:         m.From,
+			From:       r.id,
 			MsgType:    pb.MessageType_MsgAppendResponse,
 			Term:       r.Term,
 			Index:      m.Index,

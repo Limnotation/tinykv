@@ -758,6 +758,8 @@ func TestLeaderSyncFollowerLog2AB(t *testing.T) {
 
 		n.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{}}})
 
+		fmt.Printf("leader: %s\n", ltoa(lead.RaftLog))
+		fmt.Printf("follower: %s\n", ltoa(follower.RaftLog))
 		if g := diffu(ltoa(lead.RaftLog), ltoa(follower.RaftLog)); g != "" {
 			t.Errorf("#%d: log diff:\n%s", i, g)
 		}
