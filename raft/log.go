@@ -390,3 +390,21 @@ func (l *RaftLog) findConflict(ents []pb.Entry) uint64 {
 	}
 	return 0
 }
+
+func (l *RaftLog) lastTerm() uint64 {
+	t, err := l.Term(l.LastIndex())
+	if err != nil {
+		l.logger.Sugar().Panicf("unexpected error when getting the last term (%v)", err)
+	}
+	return t
+}
+
+// isUpToDate determines if the given (lastIndex,term) log is more up-to-date
+// by comparing the index and term of the last entries in the existing logs.
+// If the logs have last entries with different terms, then the log with the
+// later term is more up-to-date. If the logs end with the same term, then
+// whichever log has the larger lastIndex is more up-to-date. If the logs are
+// the same, the given log is up-to-date.
+func (l *RaftLog) isUpToDate(lasti, term uint64) bool {
+	return term > l.lastTerm() || (term == l.lastTerm() && lasti >= l.LastIndex())
+}

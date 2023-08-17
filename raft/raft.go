@@ -18,6 +18,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sync"
+	"time"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"go.uber.org/zap"
@@ -43,6 +45,25 @@ var stmap = [...]string{
 
 func (st StateType) String() string {
 	return stmap[uint64(st)]
+}
+
+// lockedRand is a small wrapper around rand.Rand to provide
+// synchronization among multiple raft groups. Only the methods needed
+// by the code are exposed (e.g. Intn).
+type lockedRand struct {
+	mu   sync.Mutex
+	rand *rand.Rand
+}
+
+func (r *lockedRand) Intn(n int) int {
+	r.mu.Lock()
+	v := r.rand.Intn(n)
+	r.mu.Unlock()
+	return v
+}
+
+var globalRand = &lockedRand{
+	rand: rand.New(rand.NewSource(time.Now().UnixNano())),
 }
 
 // ErrProposalDropped is returned when the proposal is ignored by some cases,
@@ -177,16 +198,20 @@ type Raft struct {
 
 // newRaft return a raft peer with the given config
 func newRaft(c *Config) *Raft {
+	lgr, _ := zap.NewProduction()
 	if err := c.validate(); err != nil {
-		panic(err.Error())
+		lgr.Fatal("invalid config", zap.Error(err))
 	}
 
 	// Some states need to be restored from raft log, so
 	// raft log need to be created first.
 	raftLog := newLog(c.Storage)
+	hs, _, err := c.Storage.InitialState()
+	if err != nil {
+		lgr.Fatal("failed to get initial state", zap.Error(err))
+	}
 
 	// Parse config.
-	lgr, _ := zap.NewProduction()
 	prs := make(map[uint64]*Progress, 0)
 	votes := make(map[uint64]bool, 0)
 	for _, peer := range c.peers {
@@ -194,7 +219,6 @@ func newRaft(c *Config) *Raft {
 			Match: 0,
 			Next:  raftLog.LastIndex() + 1,
 		}
-		votes[peer] = false
 	}
 
 	r := &Raft{
@@ -208,6 +232,10 @@ func newRaft(c *Config) *Raft {
 		maxMsgSize:       1024 * 1024,
 	}
 
+	if !IsEmptyHardState(hs) {
+		r.loadState(hs)
+	}
+
 	// All raft instances start as followers.
 	r.becomeFollower(r.Term, None)
 
@@ -217,6 +245,10 @@ func newRaft(c *Config) *Raft {
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
+	return r.maybeSendAppend(to, true)
+}
+
+func (r *Raft) maybeSendAppend(to uint64, sendIfEmpty bool) bool {
 	pr := r.Prs[to]
 	if pr == nil {
 		return false
@@ -235,9 +267,10 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 	// Try get entries from log to send.
 	entss, err := r.RaftLog.entriesRange(pr.Next, r.maxMsgSize)
-	if len(entss) == 0 || err != nil {
+	if err != nil && len(entss) == 0 && !sendIfEmpty {
 		return false
 	}
+
 	ents := messageStrucSliceToPtrSlice(entss)
 
 	m.MsgType = pb.MessageType_MsgAppend
@@ -247,17 +280,32 @@ func (r *Raft) sendAppend(to uint64) bool {
 	m.Commit = r.RaftLog.committed
 	m.Term = r.Term
 
+	// When we do have entries to send to followers, we do an optimistic
+	// update of the progress.
+	if n := len(ents); n != 0 {
+		li := ents[n-1].Index
+		pr.Next = li + 1
+	}
+
 	r.msgs = append(r.msgs, m)
 	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
+	// Attach the commit as min(to.matched, r.committed).
+	// When the leader sends out heartbeat message,
+	// the receiver(follower) might not be matched with the leader
+	// or it might not have all the committed entries.
+	// The leader MUST NOT forward the follower's commit to
+	// an unmatched index.
+	commit := min(r.Prs[to].Match, r.RaftLog.committed)
 	m := pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeat,
 		To:      to,
 		From:    r.id,
 		Term:    r.Term,
+		Commit:  commit,
 	}
 
 	r.msgs = append(r.msgs, m)
@@ -309,7 +357,7 @@ func (r *Raft) tickHeartbeat() {
 }
 
 func (r *Raft) resetRandomizedElectionTimeout() {
-	r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+	r.randomizedElectionTimeout = r.electionTimeout + globalRand.Intn(r.electionTimeout)
 }
 
 // becomeFollower transform this peer's state to Follower
@@ -330,6 +378,7 @@ func (r *Raft) becomeCandidate() {
 	r.reset(r.Term + 1)
 
 	r.Vote = r.id
+	r.votes[r.id] = true
 	r.State = StateCandidate
 	r.RaftLgr.Sugar().Infof("[%d] became candidate at term [%d]", r.id, r.Term)
 }
@@ -432,6 +481,13 @@ func (r *Raft) reset(term uint64) {
 
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
+	r.votes = map[uint64]bool{}
+	for pr := range r.Prs {
+		r.Prs[pr] = &Progress{
+			Match: 0,
+			Next:  r.RaftLog.LastIndex() + 1,
+		}
+	}
 	r.resetRandomizedElectionTimeout()
 }
 
@@ -474,7 +530,7 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgHup:
 			r.campaign()
 		case pb.MessageType_MsgRequestVote:
-			if canVote {
+			if canVote && r.RaftLog.isUpToDate(m.Index, m.LogTerm) {
 				r.RaftLgr.Sugar().Infof("%x [vote: %x] cast vote for %x at term %d",
 					r.id, r.Vote, m.From, r.Term)
 
@@ -511,6 +567,10 @@ func (r *Raft) Step(m pb.Message) error {
 				m.To = r.Lead
 				r.msgs = append(r.msgs, m)
 			}
+		case pb.MessageType_MsgHeartbeat:
+			r.electionElapsed = 0
+			r.Lead = m.From
+			r.handleHeartbeat(m)
 		default:
 			r.RaftLgr.Info("Message type that follower will not handle", zap.Any("type", m.MsgType))
 		}
@@ -524,22 +584,41 @@ func (r *Raft) Step(m pb.Message) error {
 					r.id, r.Vote, m.From, r.Term)
 				r.electionElapsed = 0
 				r.Vote = m.From
-				r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgRequestVoteResponse, To: m.From, Term: m.Term, Reject: false})
+				r.msgs = append(r.msgs, pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					To:      m.From,
+					Term:    m.Term,
+					Reject:  false,
+				})
 			} else {
+				r.msgs = append(r.msgs, pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					To:      m.From,
+					From:    r.id,
+					Term:    m.Term,
+					Reject:  true,
+				})
 				r.RaftLgr.Sugar().Infof("%x [vote: %x] rejected vote for %x at term %d",
 					r.id, r.Vote, m.From, r.Term)
 			}
 		case pb.MessageType_MsgRequestVoteResponse:
-			if m.Reject {
-				r.votes[m.From] = false
-			} else {
-				r.votes[m.From] = true
+			_, ok := r.votes[m.From]
+			if !ok {
+				r.votes[m.From] = !m.Reject
 			}
 
 			tally := 0
-			for _, v := range r.votes {
+			lost := 0
+			for pr := range r.Prs {
+				v, voted := r.votes[pr]
+				if !voted {
+					continue
+				}
+
 				if v {
 					tally++
+				} else {
+					lost++
 				}
 			}
 			if tally > len(r.Prs)/2 {
@@ -547,6 +626,9 @@ func (r *Raft) Step(m pb.Message) error {
 				// to commit previous entries and notifying followers of its leadership.
 				r.becomeLeader()
 				r.bcastAppend()
+			} else if lost > len(r.Prs)/2 {
+				// At this point, the candidate has known that a higher term has occurred.
+				r.becomeFollower(r.Term, None)
 			}
 		case pb.MessageType_MsgAppend:
 			r.becomeFollower(m.Term, m.From)
@@ -555,6 +637,9 @@ func (r *Raft) Step(m pb.Message) error {
 			// Candidate cannot process propose requests since it has no leader.
 			r.RaftLgr.Sugar().Infof("%x [term: %d] no leader at term; dropping proposal", r.id, r.Term)
 			return ErrProposalDropped
+		case pb.MessageType_MsgHeartbeat:
+			r.becomeFollower(m.Term, m.From)
+			r.handleHeartbeat(m)
 		default:
 			r.RaftLgr.Info("Message type that candidate will not handle", zap.Any("type", m.MsgType))
 		}
@@ -562,6 +647,17 @@ func (r *Raft) Step(m pb.Message) error {
 		switch m.MsgType {
 		case pb.MessageType_MsgHup:
 			r.RaftLgr.Error("Ignoring MessageType_MsgHup because current role is already leader", zap.Any("id", r.id))
+		case pb.MessageType_MsgRequestVote:
+			// When execution hits this branch, the messages's term must be
+			// equally to current leader's term, in this case the leader can
+			// certainly reject the vote request.
+			r.msgs = append(r.msgs, pb.Message{
+				MsgType: pb.MessageType_MsgRequestVoteResponse,
+				To:      m.From,
+				From:    r.id,
+				Term:    m.Term,
+				Reject:  true,
+			})
 		case pb.MessageType_MsgBeat:
 			r.bcastHeartbeat()
 		case pb.MessageType_MsgPropose:
@@ -607,14 +703,24 @@ func (r *Raft) Step(m pb.Message) error {
 				r.Prs[m.From].Next = min(m.Index, m.RejectHint+1)
 				r.sendAppend(m.From)
 			} else {
-				// No sanity checks yet, improve later.
-				r.Prs[m.From].Match = m.Index
-				r.Prs[m.From].Next = m.Index + 1
+				// Check if more update is needed, this is to avoid
+				// infinite loop of sending append messages.
+				if r.Prs[m.From].Match >= m.Index {
+					return nil
+				}
+
+				// Update progress.
+				if r.Prs[m.From].Match < m.Index {
+					r.Prs[m.From].Match = m.Index
+				}
+				if r.Prs[m.From].Next < m.Index+1 {
+					r.Prs[m.From].Next = m.Index + 1
+				}
 
 				// Update commit index if possible.
 				reach := 0
 				for _, pr := range r.Prs {
-					if pr.Match >= r.RaftLog.committed {
+					if pr.Match > r.RaftLog.committed {
 						reach++
 					}
 				}
@@ -625,6 +731,16 @@ func (r *Raft) Step(m pb.Message) error {
 					r.maybecommit()
 					r.bcastAppend()
 				}
+			}
+		case pb.MessageType_MsgHeartbeatResponse:
+			pr, exi := r.Prs[m.From]
+			if !exi {
+				r.RaftLgr.Panic("no progress available for this peer", zap.Any("id", m.From))
+			}
+
+			// Update progress if needed.
+			if pr.Match < r.RaftLog.LastIndex() {
+				r.sendAppend(m.From)
 			}
 		default:
 			r.RaftLgr.Info("Message type that leader will not handle", zap.Any("type", m.MsgType))
@@ -649,13 +765,13 @@ func (r *Raft) campaign() {
 	r.votes[r.id] = true
 
 	// Short cut: wins the election if there's only one node in the cluster.
-	if len(r.votes) == 1 && r.votes[r.id] {
+	if len(r.Prs) == 1 && r.votes[r.id] {
 		r.becomeLeader()
 	}
 
 	// Iterate voter list and send vote request, but don't send vote message to self
 	// since a candidate will always vote for itself.
-	for voter := range r.votes {
+	for voter := range r.Prs {
 		if voter == r.id {
 			continue
 		}
@@ -666,6 +782,8 @@ func (r *Raft) campaign() {
 			To:      voter,
 			From:    r.id,
 			Term:    term,
+			LogTerm: r.RaftLog.lastTerm(),
+			Index:   r.RaftLog.LastIndex(),
 		})
 	}
 }
@@ -730,9 +848,24 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	}
 }
 
+func (r *Raft) loadState(hs pb.HardState) {
+	if hs.Commit < r.RaftLog.committed || hs.Commit > r.RaftLog.LastIndex() {
+		r.RaftLgr.Sugar().Fatalf("%x state.commit %d is out of range [%d, %d]", r.id, hs.Commit, r.RaftLog.committed, r.RaftLog.LastIndex())
+	}
+
+	r.RaftLog.committed = hs.Commit
+	r.Term = hs.Term
+	r.Vote = hs.Vote
+}
+
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
-	// Your Code Here (2A).
+	r.RaftLog.commitTo(m.Commit)
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeatResponse,
+		To:      m.From,
+		From:    r.id,
+	})
 }
 
 // handleSnapshot handle Snapshot RPC request
