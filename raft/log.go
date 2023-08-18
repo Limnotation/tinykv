@@ -408,3 +408,32 @@ func (l *RaftLog) lastTerm() uint64 {
 func (l *RaftLog) isUpToDate(lasti, term uint64) bool {
 	return term > l.lastTerm() || (term == l.lastTerm() && lasti >= l.LastIndex())
 }
+
+func (l *RaftLog) appliedTo(i uint64) {
+	if i == 0 {
+		return
+	}
+
+	if l.committed < i || i < l.applied {
+		l.logger.Sugar().Panicf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", i, l.applied, l.committed)
+	}
+
+	l.applied = i
+}
+
+func (l *RaftLog) stableTo(i, t uint64) {
+	if i <= l.stabled || i > l.LastIndex() {
+		l.logger.Sugar().Panicf("stableTo(%d) is out of range [stable(%d), lastIndex(%d)]",
+			i, l.stabled, l.LastIndex())
+	}
+
+	term, err := l.Term(i)
+	if err != nil {
+		l.logger.Sugar().Panicf("unexpected error when getting the term of index %d (%v)", i, err)
+	}
+
+	if term == t {
+		l.entries = l.entries[:i+1-l.entries[0].Index]
+		l.stabled = i
+	}
+}
