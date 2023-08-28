@@ -19,8 +19,13 @@ type peerState struct {
 
 // router routes a message to a peer.
 type router struct {
-	peers       sync.Map // regionID -> peerState
-	peerSender  chan message.Msg
+	// regionID -> peerState
+	peers sync.Map
+
+	// peerSender takes all incoming messages and send them to the channel.
+	peerSender chan message.Msg
+
+	// storeSender sends messages to the local store to handle.
 	storeSender chan<- message.Msg
 }
 

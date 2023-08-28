@@ -14,7 +14,8 @@ type raftWorker struct {
 	// * raft command from `raftStorage`
 	// * raft inner messages from other peers sent by network
 	raftCh chan message.Msg
-	ctx    *GlobalContext
+
+	ctx *GlobalContext
 
 	closeCh <-chan struct{}
 }
@@ -29,11 +30,13 @@ func newRaftWorker(ctx *GlobalContext, pm *router) *raftWorker {
 
 // run runs raft commands.
 // On each loop, raft commands are batched by channel buffer.
-// After commands are handled, we collect apply messages by peers, make a applyBatch, send it to apply channel.
+// After commands are handled, we collect apply messages by peers,
+// make a applyBatch, send it to apply channel.
 func (rw *raftWorker) run(closeCh <-chan struct{}, wg *sync.WaitGroup) {
 	defer wg.Done()
 	var msgs []message.Msg
 	for {
+		// Poll message.
 		msgs = msgs[:0]
 		select {
 		case <-closeCh:
@@ -41,10 +44,14 @@ func (rw *raftWorker) run(closeCh <-chan struct{}, wg *sync.WaitGroup) {
 		case msg := <-rw.raftCh:
 			msgs = append(msgs, msg)
 		}
+
+		// Drain all messages from the channel.
 		pending := len(rw.raftCh)
 		for i := 0; i < pending; i++ {
 			msgs = append(msgs, <-rw.raftCh)
 		}
+
+		// Raft module reads and handle messages.
 		peerStateMap := make(map[uint64]*peerState)
 		for _, msg := range msgs {
 			peerState := rw.getPeerState(peerStateMap, msg.RegionID)

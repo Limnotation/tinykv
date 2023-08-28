@@ -12,7 +12,8 @@ import (
 // the Path fields are the filesystem path to where the data is stored.
 type Engines struct {
 	// Data, including data which is committed (i.e., committed across other nodes)
-	// and un-committed (i.e., only present locally).
+	// and un-committed (i.e., only present locally). Also, this badge instance will
+	// store `RegionLocalState` and `RaftApplyState`.
 	Kv     *badger.DB
 	KvPath string
 

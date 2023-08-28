@@ -62,8 +62,6 @@ func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest
 
 // RawScan scan the data starting from the start key up to limit. and return the corresponding result
 func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*kvrpcpb.RawScanResponse, error) {
-	// Your Code Here (1).
-	// Hint: Consider using reader.IterCF
 	kvPairs := make([]*kvrpcpb.KvPair, 0)
 	reader, err := server.storage.Reader(req.Context)
 	if err != nil {

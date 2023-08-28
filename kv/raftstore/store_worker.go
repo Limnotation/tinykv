@@ -25,10 +25,17 @@ const (
 	StoreTickSnapGC                  StoreTick = 2
 )
 
+// storeState represents the state of a store?
 type storeState struct {
-	id       uint64
+	id uint64
+
+	// storeState instance holds the receiver side of a channel for exchanging
+	// message.Msg's. The sender side is used as the return value when creating
+	// a storeWorker instance. It looks like this receiver only receives Msgs
+	// that are of types that used for internal communications.
 	receiver <-chan message.Msg
-	ticker   *ticker
+
+	ticker *ticker
 }
 
 func newStoreState(cfg *config.Config) (chan<- message.Msg, *storeState) {
@@ -94,9 +101,9 @@ func (d *storeWorker) start(store *metapb.Store) {
 	d.ticker.scheduleStore(StoreTickSnapGC)
 }
 
-/// Checks if the message is targeting a stale peer.
-///
-/// Returns true means the message can be dropped silently.
+// Checks if the message is targeting a stale peer.
+//
+// Returns true means the message can be dropped silently.
 func (d *storeWorker) checkMsg(msg *rspb.RaftMessage) (bool, error) {
 	regionID := msg.GetRegionId()
 	fromEpoch := msg.GetRegionEpoch()
@@ -188,10 +195,10 @@ func (d *storeWorker) onRaftMessage(msg *rspb.RaftMessage) error {
 	return nil
 }
 
-/// If target peer doesn't exist, create it.
-///
-/// return false to indicate that target peer is in invalid state or
-/// doesn't exist and can't be created.
+// / If target peer doesn't exist, create it.
+// /
+// / return false to indicate that target peer is in invalid state or
+// / doesn't exist and can't be created.
 func (d *storeWorker) maybeCreatePeer(regionID uint64, msg *rspb.RaftMessage) (bool, error) {
 	// we may encounter a message with larger peer id, which means
 	// current peer is stale, then we should remove current peer

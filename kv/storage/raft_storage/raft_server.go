@@ -22,11 +22,14 @@ import (
 	"github.com/pingcap/errors"
 )
 
-// RaftStorage is an implementation of `Storage` (see tikv/server.go) backed by a Raft node. It is part of a Raft network.
-// By using Raft, reads and writes are consistent with other nodes in the TinyKV instance.
+// RaftStorage is an implementation of `Storage` (see tikv/server.go) backed by a Raft node.
+// It is part of a Raft network. By using Raft, reads and writes are consistent with other
+// nodes in the TinyKV instance.
 type RaftStorage struct {
+	// engines are places where the data is actually stored.
 	engines *engine_util.Engines
-	config  *config.Config
+
+	config *config.Config
 
 	node          *raftstore.Node
 	snapManager   *snap.SnapManager
@@ -109,6 +112,7 @@ func (rs *RaftStorage) Write(ctx *kvrpcpb.Context, batch []storage.Modify) error
 		Header:   header,
 		Requests: reqs,
 	}
+
 	cb := message.NewCallback()
 	if err := rs.raftRouter.SendRaftCommand(request, cb); err != nil {
 		return err
@@ -175,10 +179,14 @@ func (rs *RaftStorage) Snapshot(stream tinykvpb.TinyKv_SnapshotServer) error {
 
 func (rs *RaftStorage) Start() error {
 	cfg := rs.config
+
+	// Scheduler can be ignored here.
 	schedulerClient, err := scheduler_client.NewClient(strings.Split(cfg.SchedulerAddr, ","), "")
 	if err != nil {
 		return err
 	}
+
+	// Just remember that `raftRouter` is on the sender side and `raftSystem` is on the receiver side.
 	rs.raftRouter, rs.raftSystem = raftstore.CreateRaftstore(cfg)
 
 	rs.resolveWorker = worker.NewWorker("resolver", &rs.wg)

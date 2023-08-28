@@ -53,6 +53,9 @@ type PeerStorage struct {
 // NewPeerStorage get the persist raftState from engines and return a peer storage
 func NewPeerStorage(engines *engine_util.Engines, region *metapb.Region, regionSched chan<- worker.Task, tag string) (*PeerStorage, error) {
 	log.Debugf("%s creating storage for %s", tag, region.String())
+
+	// When in the initialization phase, both RaftLocalState and RaftApplyState are
+	// derived from the provided region.
 	raftState, err := meta.InitRaftLocalState(engines.Raft, region)
 	if err != nil {
 		return nil, err
@@ -65,6 +68,7 @@ func NewPeerStorage(engines *engine_util.Engines, region *metapb.Region, regionS
 		panic(fmt.Sprintf("%s unexpected raft log index: lastIndex %d < appliedIndex %d",
 			tag, raftState.LastIndex, applyState.AppliedIndex))
 	}
+
 	return &PeerStorage{
 		Engines:     engines,
 		region:      region,
@@ -90,14 +94,17 @@ func (ps *PeerStorage) Entries(low, high uint64) ([]eraftpb.Entry, error) {
 	if err := ps.checkRange(low, high); err != nil || low == high {
 		return nil, err
 	}
+
 	buf := make([]eraftpb.Entry, 0, high-low)
 	nextIndex := low
 	txn := ps.Engines.Raft.NewTransaction(false)
 	defer txn.Discard()
+
 	startKey := meta.RaftLogKey(ps.region.Id, low)
 	endKey := meta.RaftLogKey(ps.region.Id, high)
 	iter := txn.NewIterator(badger.DefaultIteratorOptions)
 	defer iter.Close()
+
 	for iter.Seek(startKey); iter.Valid(); iter.Next() {
 		item := iter.Item()
 		if bytes.Compare(item.Key(), endKey) >= 0 {
@@ -304,8 +311,8 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 	return nil
 }
 
-// Append the given entries to the raft log and update ps.raftState also delete log entries that will
-// never be committed
+// Append the given entries to the raft log and update ps.raftState,
+// also delete log entries that will never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
 	return nil
@@ -329,9 +336,25 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 // Save memory states to disk.
 // Do not modify ready in this function, this is a requirement to advance the ready object properly later.
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
-	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
-	// Your Code Here (2B/2C).
-	return nil, nil
+	// Raft log entries and RaftLocalState are stored in raftdb.
+	raftLocalState := rspb.RaftLocalState{
+		HardState: &ready.HardState,
+		LastIndex: ready.HardState.Commit,
+		LastTerm:  ready.HardState.Term,
+	}
+	raftLocalStateWb := engine_util.WriteBatch{}
+	raftLocalStateWb.SetMeta(meta.RaftStateKey(ps.region.Id), &raftLocalState)
+	if err := ps.Append(ready.Entries, &raftLocalStateWb); err != nil {
+		return nil, err
+	}
+
+	// Key-value data, RegionLocalState and RaftApplyState are stored in kvdb.
+	raftApplyState := rspb.RaftApplyState{
+		AppliedIndex: ready.HardState.Commit - 1,
+	}
+	raftApplyStateWB := engine_util.WriteBatch{}
+	raftApplyStateWB.SetMeta(meta.ApplyStateKey(ps.region.Id), &raftApplyState)
+	return ps.ApplySnapshot(&ready.Snapshot, &raftLocalStateWb, &raftApplyStateWB)
 }
 
 func (ps *PeerStorage) ClearData() {

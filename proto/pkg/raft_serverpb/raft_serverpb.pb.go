@@ -52,7 +52,7 @@ func (PeerState) EnumDescriptor() ([]byte, []int) {
 	return fileDescriptor_130ebc2f2c37a342, []int{0}
 }
 
-// The message sent between Raft peer, it wraps the raft meessage with some meta information.
+// The message sent between Raft peers, it wraps the raft meessage with some meta information.
 type RaftMessage struct {
 	RegionId    uint64              `protobuf:"varint,1,opt,name=region_id,json=regionId,proto3" json:"region_id,omitempty"`
 	FromPeer    *metapb.Peer        `protobuf:"bytes,2,opt,name=from_peer,json=fromPeer,proto3" json:"from_peer,omitempty"`
@@ -158,7 +158,8 @@ func (m *RaftMessage) GetEndKey() []byte {
 	return nil
 }
 
-// Used to store the persistent state for Raft, including the hard state for raft and the last index of the raft log.
+// Used to store the persistent state for Raft, including the hard state for
+// raft and the last index of the raft log.
 type RaftLocalState struct {
 	HardState            *eraftpb.HardState `protobuf:"bytes,1,opt,name=hard_state,json=hardState,proto3" json:"hard_state,omitempty"`
 	LastIndex            uint64             `protobuf:"varint,2,opt,name=last_index,json=lastIndex,proto3" json:"last_index,omitempty"`

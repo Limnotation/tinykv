@@ -4,7 +4,7 @@ package raft_serverpb;
 import "eraftpb.proto";
 import "metapb.proto";
 
-// The message sent between Raft peer, it wraps the raft meessage with some meta information.
+// The message sent between Raft peers, it wraps the raft meessage with some meta information.
 message RaftMessage {
     uint64 region_id = 1;
     metapb.Peer from_peer = 2;
@@ -18,7 +18,8 @@ message RaftMessage {
     bytes end_key = 8;
 }
 
-// Used to store the persistent state for Raft, including the hard state for raft and the last index of the raft log.
+// Used to store the persistent state for Raft, including the hard state for 
+// raft and the last index of the raft log.
 message RaftLocalState {
     eraftpb.HardState hard_state = 1;
     uint64 last_index = 2;

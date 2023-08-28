@@ -59,6 +59,7 @@ var (
 	errFailInitClusterID = errors.New("[scheduler] failed to get cluster id")
 )
 
+// What does this client really do?
 type client struct {
 	urls      []string
 	clusterID uint64
