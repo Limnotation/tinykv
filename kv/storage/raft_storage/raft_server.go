@@ -180,7 +180,8 @@ func (rs *RaftStorage) Snapshot(stream tinykvpb.TinyKv_SnapshotServer) error {
 func (rs *RaftStorage) Start() error {
 	cfg := rs.config
 
-	// Scheduler can be ignored here.
+	// Scheduler client, this is used to communicate with scheduler to coordinate
+	// multiple raft groups. This part can be ignored for now.
 	schedulerClient, err := scheduler_client.NewClient(strings.Split(cfg.SchedulerAddr, ","), "")
 	if err != nil {
 		return err

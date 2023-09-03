@@ -22,7 +22,7 @@ type router struct {
 	// regionID -> peerState
 	peers sync.Map
 
-	// peerSender takes all incoming messages and send them to the channel.
+	// peerSender takes messages that might have to be exchanged among peers.
 	peerSender chan message.Msg
 
 	// storeSender sends messages to the local store to handle.
@@ -90,15 +90,17 @@ func (r *RaftstoreRouter) Send(regionID uint64, msg message.Msg) error {
 	return r.router.send(regionID, msg)
 }
 
+// SendRaftMessage sends raft messages to target the peer recognized by the given region ID.
+// If the message sending fails, store the message `locally` for later retrys.
 func (r *RaftstoreRouter) SendRaftMessage(msg *raft_serverpb.RaftMessage) error {
 	regionID := msg.RegionId
 	if r.router.send(regionID, message.NewPeerMsg(message.MsgTypeRaftMessage, regionID, msg)) != nil {
 		r.router.sendStore(message.NewPeerMsg(message.MsgTypeStoreRaftMessage, regionID, msg))
 	}
 	return nil
-
 }
 
+// SendRaftCommand sends raft command to target the peer recognized by the given region ID.
 func (r *RaftstoreRouter) SendRaftCommand(req *raft_cmdpb.RaftCmdRequest, cb *message.Callback) error {
 	cmd := &message.MsgRaftCmd{
 		Request:  req,

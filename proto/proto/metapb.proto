@@ -21,11 +21,11 @@ enum StoreState {
     Tombstone = 2;
 }
 
-// Store stands for an instance of tinykv-server
+// Store stands for an instance of tinykv-server.
 message Store {
-    // Server ID.
+    // Store ID.
     uint64 id = 1;
-    // Address to handle client requests (kv, cop, etc.)
+    // Address for accepting client requests.
     string address = 2;
     // State of the store, one of Offline, Up, Tombstone.
     StoreState state = 3;
