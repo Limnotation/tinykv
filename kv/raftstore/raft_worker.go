@@ -36,7 +36,7 @@ func (rw *raftWorker) run(closeCh <-chan struct{}, wg *sync.WaitGroup) {
 	defer wg.Done()
 	var msgs []message.Msg
 	for {
-		// Poll message.
+		// Try to poll message.
 		msgs = msgs[:0]
 		select {
 		case <-closeCh:

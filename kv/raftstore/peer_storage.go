@@ -54,8 +54,6 @@ type PeerStorage struct {
 func NewPeerStorage(engines *engine_util.Engines, region *metapb.Region, regionSched chan<- worker.Task, tag string) (*PeerStorage, error) {
 	log.Debugf("%s creating storage for %s", tag, region.String())
 
-	// When in the initialization phase, both RaftLocalState and RaftApplyState are
-	// derived from the provided region.
 	raftState, err := meta.InitRaftLocalState(engines.Raft, region)
 	if err != nil {
 		return nil, err
@@ -90,6 +88,7 @@ func (ps *PeerStorage) InitialState() (eraftpb.HardState, eraftpb.ConfState, err
 	return *raftState.HardState, util.ConfStateFromRegion(ps.region), nil
 }
 
+// Fetch Raft log entries.
 func (ps *PeerStorage) Entries(low, high uint64) ([]eraftpb.Entry, error) {
 	if err := ps.checkRange(low, high); err != nil || low == high {
 		return nil, err

@@ -55,6 +55,6 @@ message Region {
 message Peer {     
     // Raft node ID.     
     uint64 id = 1;
-    // Store ID that this peer lives.
+    // ID of the Store that this peer lives.
     uint64 store_id = 2;
 }

@@ -26,7 +26,7 @@ import (
 // It is part of a Raft network. By using Raft, reads and writes are consistent with other
 // nodes in the TinyKV instance.
 type RaftStorage struct {
-	// engines are places where the data is actually stored.
+	// engines stands for badger instances where the data is actually stored.
 	engines *engine_util.Engines
 
 	config *config.Config

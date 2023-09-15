@@ -109,11 +109,11 @@ func (m *Cluster) GetMaxPeerCount() uint32 {
 	return 0
 }
 
-// Store stands for an instance of tinykv-server
+// Store stands for an instance of tinykv-server.
 type Store struct {
-	// Server ID.
+	// Store ID.
 	Id uint64 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
-	// Address to handle client requests (kv, cop, etc.)
+	// Address for accepting client requests.
 	Address string `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
 	// State of the store, one of Offline, Up, Tombstone.
 	State                StoreState `protobuf:"varint,3,opt,name=state,proto3,enum=metapb.StoreState" json:"state,omitempty"`
@@ -321,7 +321,7 @@ func (m *Region) GetPeers() []*Peer {
 type Peer struct {
 	// Raft node ID.
 	Id uint64 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
-	// Store ID that this peer lives.
+	// ID of the Store that this peer lives.
 	StoreId              uint64   `protobuf:"varint,2,opt,name=store_id,json=storeId,proto3" json:"store_id,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
